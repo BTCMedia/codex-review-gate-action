@@ -72,8 +72,15 @@ import {
 } from "./evidence-budget.mjs";
 
 const MAX_EVIDENCE_ITEMS_PER_SNAPSHOT = 20_000;
-const MAX_EVIDENCE_RESPONSE_BYTES = 8 * 1024 * 1024;
-const MAX_EVIDENCE_RESPONSE_BYTES_PER_RUN = 64 * 1024 * 1024;
+// Ceiling on ONE HTTP response, not on a whole paginated sweep — the per-sweep ceiling is
+// DEFAULT_MAX_EVIDENCE_RESPONSE_BYTES_PER_RUN below. Both are DEFAULTS: a repo whose review history has
+// outgrown them can raise either via the evidence-max-response-bytes[-per-run] inputs rather than
+// being permanently wedged. That is not hypothetical — a single `per_page=100` page of
+// /pulls/:n/comments is ~80KB per comment once `diff_hunk` is counted, so a long review on a large
+// file crosses 8MiB on ONE page and the gate then fails closed on every retry, including the
+// scheduled sweep. A wedged gate cannot be waited out: the payload only grows as review continues.
+const DEFAULT_MAX_EVIDENCE_RESPONSE_BYTES = 8 * 1024 * 1024;
+const DEFAULT_MAX_EVIDENCE_RESPONSE_BYTES_PER_RUN = 64 * 1024 * 1024;
 const MAX_EVIDENCE_REQUEST_ATTEMPTS_PER_RUN = 1_024;
 const MAX_EVIDENCE_HTTP_CONCURRENCY = 4;
 const MAX_REVIEW_THREAD_COMMENT_CONCURRENCY = 4;
@@ -1796,8 +1803,8 @@ async function saveState(state, stateComment) {
 function createEvidenceWorkBudget() {
   return new EvidenceWorkBudget({
     maxItemsPerSnapshot: MAX_EVIDENCE_ITEMS_PER_SNAPSHOT,
-    maxResponseBytes: MAX_EVIDENCE_RESPONSE_BYTES,
-    maxResponseBytesPerWork: MAX_EVIDENCE_RESPONSE_BYTES_PER_RUN,
+    maxResponseBytes: config.maxEvidenceResponseBytes,
+    maxResponseBytesPerWork: config.maxEvidenceResponseBytesPerRun,
     maxRequestAttemptsPerWork: MAX_EVIDENCE_REQUEST_ATTEMPTS_PER_RUN,
     maxConcurrency: MAX_EVIDENCE_HTTP_CONCURRENCY,
   });
@@ -2584,6 +2591,14 @@ function readConfig() {
     runId: requiredEnv("GITHUB_RUN_ID"),
     runAttempt: process.env.GITHUB_RUN_ATTEMPT || "1",
     maxWaitMs: secondsEnv("MAX_WAIT_SECONDS", 7200, { allowZero: false }) * 1000,
+    maxEvidenceResponseBytes: bytesEnv(
+      "EVIDENCE_MAX_RESPONSE_BYTES",
+      DEFAULT_MAX_EVIDENCE_RESPONSE_BYTES,
+    ),
+    maxEvidenceResponseBytesPerRun: bytesEnv(
+      "EVIDENCE_MAX_RESPONSE_BYTES_PER_RUN",
+      DEFAULT_MAX_EVIDENCE_RESPONSE_BYTES_PER_RUN,
+    ),
     requestTimeoutMs:
       secondsEnv("CODEX_REVIEW_GATE_REQUEST_TIMEOUT_SECONDS", 60, {
         allowZero: false,
@@ -2631,6 +2646,22 @@ function secondsEnv(name, fallback, { allowZero }) {
   const valid = Number.isFinite(parsed) && (allowZero ? parsed >= 0 : parsed > 0);
   if (!valid) {
     throw new Error(`${name} must be a ${allowZero ? "non-negative" : "positive"} number`);
+  }
+  return parsed;
+}
+
+// Byte budgets are SAFE INTEGERS, unlike the seconds inputs, which tolerate fractions:
+// EvidenceWorkBudget rejects a non-integer limit in its own constructor, and doing that validation
+// here means a typo fails at config-read with the offending variable named, rather than surfacing
+// later as an opaque budget-construction error mid-sweep.
+function bytesEnv(name, fallback) {
+  const raw = process.env[name];
+  if (!raw || !raw.trim()) {
+    return fallback;
+  }
+  const parsed = Number(raw.trim());
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error(`${name} must be a positive integer number of bytes`);
   }
   return parsed;
 }
