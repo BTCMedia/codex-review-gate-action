@@ -17,6 +17,7 @@ import {
   autoRetryEnabled,
   buildMarkerCommentBody,
   buildStateCommentBody,
+  classifyCleanEvidenceForHead,
   closeActiveMarker,
   codexInlineParentReviewBodyHasClosedGrammar,
   collectCodexThreadEvidence,
@@ -50,6 +51,7 @@ import {
   parseStateCommentBody,
   parseTimestamp,
   pullRequestIsDependabot,
+  pullRequestLifecycleEnded,
   reconcileStateWithMarkerComment,
   restRequestRetryAllowed,
   retryAfterDelayMs,
@@ -167,12 +169,20 @@ main().catch(async (error) => {
       ? error
       : new GateFailure("error", "Codex review gate errored", error.message);
 
-  if (statusSha && statusReady) {
+  if (statusSha && statusReady && !gateError.suppressStatus) {
     try {
       await setCommitStatus(gateError.state, gateError.description);
     } catch (statusError) {
       console.error(`failed to set final ${STATUS_CONTEXT} status: ${statusError.message}`);
     }
+  }
+
+  if (gateError.suppressStatus) {
+    // A genuine no-op, not a failure: the PR this run was about is closed or merged, so there is
+    // no verdict to publish and nothing went wrong. Exiting non-zero here would leave a red run in
+    // the Actions list for every late event delivery after a merge.
+    console.log(gateError.message);
+    return;
   }
 
   console.error(error.stack || error.message);
@@ -2252,14 +2262,27 @@ async function selectCurrentHeadProviderResult(artifacts, evidenceBudget) {
           headSha: resolvedSha,
         };
       }
-      if (
-        await commitIsAncestor(
-          resolvedSha,
-          statusSha.toLowerCase(),
-          ancestryCache,
-          evidenceBudget,
-        )
-      ) {
+      // Stale evidence — a genuine clean result bound to some commit that is not this head —
+      // must NOT pass the gate, and must not terminate the run either. `malformed` here used to
+      // do the latter: failIfSnapshotEvidenceIsInvalid throws before a marker is opened and
+      // before state is written, so every later run re-read the same stale state and threw again,
+      // with `error` never satisfiable by waiting (BTCMedia/btc-inc-os#1664). `pending` holds the
+      // same line and lets the run open a fresh cycle for the current head.
+      //
+      // Both the ancestor case (ordinary push) and the non-ancestor case (rebase / force-push,
+      // which orphans the reviewed commit) are stale in exactly the same sense. The ancestor case
+      // already recovered; the force-push case is the one that deadlocked, and it is the common
+      // one wherever signed commits force `commit --amend` before every push.
+      const isAncestorOfHead = await commitIsAncestor(
+        resolvedSha,
+        statusSha.toLowerCase(),
+        ancestryCache,
+        evidenceBudget,
+      );
+      if (isAncestorOfHead) {
+        // Unchanged: an older finding on this head's own history still outranks a newer clean
+        // result. Supersession is only meaningful along a single line of history, which is why
+        // this scan stays inside the ancestor branch rather than moving above it.
         const unsupersededFinding = await firstUnsupersededOlderFinding(
           resolvedSha,
           [...group.slice(groupIndex + 1), ...ordered.slice(index)],
@@ -2270,21 +2293,17 @@ async function selectCurrentHeadProviderResult(artifacts, evidenceBudget) {
         if (unsupersededFinding) {
           return unsupersededFinding;
         }
-        return {
-          ...artifact,
-          kind: "pending",
-          headSha: resolvedSha,
-          reason:
-            `latest Codex clean result is bound to prior head ${resolvedSha}; ` +
-            `waiting for a complete clean result on current head ${statusSha.toLowerCase()}`,
-        };
       }
+      const classification = classifyCleanEvidenceForHead({
+        resolvedSha,
+        statusSha,
+        isAncestorOfHead,
+      });
       return {
         ...artifact,
-        kind: "malformed",
-        reason:
-          `latest Codex clean result resolved to ${resolvedSha}, ` +
-          `not current head ${statusSha.toLowerCase()}`,
+        kind: classification.kind,
+        headSha: resolvedSha,
+        reason: classification.reason,
       };
     }
   }
@@ -2693,16 +2712,19 @@ async function failIfPullRequestHeadChanged(phase = "while waiting for Codex") {
 }
 
 function failIfLoadedPullRequestHeadChanged(pullRequest, phase) {
-  if (
-    pullRequest.state !== "open" ||
-    pullRequest.merged === true ||
-    pullRequest.merged_at
-  ) {
-    throw new GateFailure(
+  if (pullRequestLifecycleEnded(pullRequest)) {
+    // Stop the run, but publish NOTHING. Two late deliveries after #1660 merged wrote
+    // `error: PR lifecycle changed …` onto the merge commit, leaving a permanently red required
+    // check that reads as "this merged with a failing required check" to anyone auditing history
+    // later. There is nothing left to protect at this point — the merge already happened — so a
+    // verdict here is pure misinformation. BTCMedia/btc-inc-os#1664.
+    const failure = new GateFailure(
       "error",
       `PR lifecycle changed ${phase}`,
       `PR #${activePrNumber} is no longer an open, unmerged pull request.`,
     );
+    failure.suppressStatus = true;
+    throw failure;
   }
   if (pullRequest.draft) {
     throw new GateFailure(

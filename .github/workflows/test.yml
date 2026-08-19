@@ -1,0 +1,24 @@
+name: Test
+
+# The gate this action implements is a REQUIRED merge check in the repos that consume it, so a
+# regression here blocks every merge in those repos. Until now the only automated check was
+# `npm run check`, which is a syntax parse — it would not have caught the #1664 deadlock, where the
+# code parsed perfectly and classified recoverable evidence as terminal.
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm run check
+      - run: npm test
