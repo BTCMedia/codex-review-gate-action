@@ -29,6 +29,19 @@ inputs:
     description: Hidden HTML marker used for controlled Codex request comments.
     required: false
     default: "codex-review-gate-marker"
+  evidence-max-response-bytes:
+    description: >-
+      Ceiling on a SINGLE evidence HTTP response. Raise it when a repo's review history has grown
+      past the default on one `per_page=100` page (the gate then fails closed on every retry,
+      including the scheduled sweep, and the payload only grows). Empty keeps the 8MiB default.
+    required: false
+    default: ""
+  evidence-max-response-bytes-per-run:
+    description: >-
+      Ceiling on the summed bytes of every evidence response in one gate run. Empty keeps the 64MiB
+      default. Raise alongside the per-response ceiling, which it must stay above to be reachable.
+    required: false
+    default: ""
   max-wait-seconds:
     description: Overall marker wait budget used for retry and liveness orchestration.
     required: false
@@ -99,6 +112,8 @@ runs:
         STATUS_CONTEXT: ${{ inputs.status-context }}
         STATE_MARKER: ${{ inputs.state-marker }}
         MARKER_COMMENT: ${{ inputs.marker-comment-marker }}
+        EVIDENCE_MAX_RESPONSE_BYTES: ${{ inputs.evidence-max-response-bytes }}
+        EVIDENCE_MAX_RESPONSE_BYTES_PER_RUN: ${{ inputs.evidence-max-response-bytes-per-run }}
         MAX_WAIT_SECONDS: ${{ inputs.max-wait-seconds }}
         MARKER_TIMEOUT_SECONDS: ${{ inputs.marker-timeout-seconds }}
         MARKER_ACK_TIMEOUT_SECONDS: ${{ inputs.marker-ack-timeout-seconds }}

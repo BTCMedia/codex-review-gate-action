@@ -86,6 +86,80 @@ export class GateFailure extends Error {
   }
 }
 
+/**
+ * Classify a Codex clean result against the head the gate is about to report on.
+ *
+ * The invariant this protects is unchanged: a clean result belonging to some other commit must
+ * never be reported as success on the current head. What changed is the RESPONSE when the
+ * evidence is stale-but-honest — a real Codex review of a commit that simply is not this head.
+ * That used to classify as `malformed`, which the caller turns into a terminal `error`, thrown
+ * before a new marker is opened and before state is written; the next run then re-reads the same
+ * stale state and repeats forever, and `error` is never satisfiable by waiting.
+ *
+ * `pending` holds the same line — it does not pass the gate — while leaving the run able to open
+ * a fresh cycle and ask Codex to review the current head. Fail-closed is correct; fail-stuck is
+ * not. Structurally bad evidence (duplicate artifact identities, unsortable sets, ambiguous
+ * cross-channel timestamps) is classified elsewhere and still hard-errors.
+ *
+ * Ancestry is an INPUT rather than something resolved here, so this stays pure and testable; the
+ * caller supplies it from the GitHub compare API.
+ *
+ * See BTCMedia/btc-inc-os#1664.
+ */
+export function classifyCleanEvidenceForHead({
+  resolvedSha,
+  statusSha,
+  isAncestorOfHead,
+}) {
+  const head = String(statusSha || "").toLowerCase();
+  const resolved = String(resolvedSha || "").toLowerCase();
+
+  if (resolved && resolved === head) {
+    return { kind: "clean" };
+  }
+
+  if (isAncestorOfHead) {
+    return {
+      kind: "pending",
+      reason:
+        `latest Codex clean result is bound to prior head ${resolved}; ` +
+        `waiting for a complete clean result on current head ${head}`,
+    };
+  }
+
+  // Not an ancestor: the branch was rebased or force-pushed, so the reviewed commit is orphaned
+  // rather than superseded. Ordinary here — this repo requires signed commits, so `commit --amend`
+  // plus a force-push is routine — and still not evidence about the current head.
+  return {
+    kind: "pending",
+    reason:
+      `latest Codex clean result is bound to ${resolved}, which is not an ancestor of ` +
+      `current head ${head} (the branch was rebased or force-pushed); ` +
+      `waiting for a complete clean result on the current head`,
+  };
+}
+
+/**
+ * Has this pull request stopped being something the gate should publish a verdict about?
+ *
+ * A gate run that lands after the PR closed or merged used to write `error: PR lifecycle changed`,
+ * leaving a permanently red required check on a merged commit — which reads as "this merged with a
+ * failing required check" to anyone auditing history later. Nothing is protected by that status:
+ * the merge already happened.
+ *
+ * Absent input counts as ended, so an unreadable PR never gets a status written onto it.
+ */
+export function pullRequestLifecycleEnded(pullRequest) {
+  if (!pullRequest) {
+    return true;
+  }
+  return (
+    pullRequest.state !== "open" ||
+    pullRequest.merged === true ||
+    Boolean(pullRequest.merged_at)
+  );
+}
+
 export class NonJsonResponseError extends Error {
   constructor(description, text) {
     const preview = truncate(String(text || "").replace(/\s+/g, " ").trim(), 200) || "<empty>";
@@ -1403,14 +1477,9 @@ function cleanTaglineHasPresentationGrammar(value) {
   return emojiCount > 0 && !previousWasSpace;
 }
 
-function officialCodexDisclosureHasClosedGrammar(value) {
-  const normalized = value
-    .replace(/\r\n?/g, "\n")
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .join("\n");
-  return normalized === [
+const OFFICIAL_CODEX_DISCLOSURE_VARIANTS = [
+  // Legacy disclosure (observed through 2026-07).
+  [
     "<details> <summary>ℹ️ About Codex in GitHub</summary>",
     "<br/>",
     "Codex has been enabled to automatically review pull requests in this repo. Reviews are triggered when you",
@@ -1420,7 +1489,29 @@ function officialCodexDisclosureHasClosedGrammar(value) {
     "If Codex has suggestions, it will comment; otherwise it will react with 👍.",
     "When you [sign up for Codex through ChatGPT](https://openai.com/codex), Codex can also answer questions or update the PR, like \"@codex address that feedback\".",
     "</details>",
-  ].join("\n");
+  ].join("\n"),
+  // Disclosure observed from 2026-08-01.
+  [
+    "<details> <summary>ℹ️ About Codex in GitHub</summary>",
+    "<br/>",
+    "[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you",
+    "- Open a pull request for review",
+    "- Mark a draft as ready",
+    '- Comment "@codex review".',
+    "If Codex has suggestions, it will comment; otherwise it will react with 👍.",
+    'Codex can also answer questions or update the PR. Try commenting "@codex address that feedback".',
+    "</details>",
+  ].join("\n"),
+];
+
+function officialCodexDisclosureHasClosedGrammar(value) {
+  const normalized = value
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join("\n");
+  return OFFICIAL_CODEX_DISCLOSURE_VARIANTS.includes(normalized);
 }
 
 function approvedReviewCleanBodyHasClosedGrammar(body) {

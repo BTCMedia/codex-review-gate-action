@@ -17,6 +17,7 @@ import {
   autoRetryEnabled,
   buildMarkerCommentBody,
   buildStateCommentBody,
+  classifyCleanEvidenceForHead,
   closeActiveMarker,
   codexInlineParentReviewBodyHasClosedGrammar,
   collectCodexThreadEvidence,
@@ -50,6 +51,7 @@ import {
   parseStateCommentBody,
   parseTimestamp,
   pullRequestIsDependabot,
+  pullRequestLifecycleEnded,
   reconcileStateWithMarkerComment,
   restRequestRetryAllowed,
   retryAfterDelayMs,
@@ -72,8 +74,15 @@ import {
 } from "./evidence-budget.mjs";
 
 const MAX_EVIDENCE_ITEMS_PER_SNAPSHOT = 20_000;
-const MAX_EVIDENCE_RESPONSE_BYTES = 8 * 1024 * 1024;
-const MAX_EVIDENCE_RESPONSE_BYTES_PER_RUN = 64 * 1024 * 1024;
+// Ceiling on ONE HTTP response, not on a whole paginated sweep — the per-sweep ceiling is
+// DEFAULT_MAX_EVIDENCE_RESPONSE_BYTES_PER_RUN below. Both are DEFAULTS: a repo whose review history has
+// outgrown them can raise either via the evidence-max-response-bytes[-per-run] inputs rather than
+// being permanently wedged. That is not hypothetical — a single `per_page=100` page of
+// /pulls/:n/comments is ~80KB per comment once `diff_hunk` is counted, so a long review on a large
+// file crosses 8MiB on ONE page and the gate then fails closed on every retry, including the
+// scheduled sweep. A wedged gate cannot be waited out: the payload only grows as review continues.
+const DEFAULT_MAX_EVIDENCE_RESPONSE_BYTES = 8 * 1024 * 1024;
+const DEFAULT_MAX_EVIDENCE_RESPONSE_BYTES_PER_RUN = 64 * 1024 * 1024;
 const MAX_EVIDENCE_REQUEST_ATTEMPTS_PER_RUN = 1_024;
 const MAX_EVIDENCE_HTTP_CONCURRENCY = 4;
 const MAX_REVIEW_THREAD_COMMENT_CONCURRENCY = 4;
@@ -160,12 +169,20 @@ main().catch(async (error) => {
       ? error
       : new GateFailure("error", "Codex review gate errored", error.message);
 
-  if (statusSha && statusReady) {
+  if (statusSha && statusReady && !gateError.suppressStatus) {
     try {
       await setCommitStatus(gateError.state, gateError.description);
     } catch (statusError) {
       console.error(`failed to set final ${STATUS_CONTEXT} status: ${statusError.message}`);
     }
+  }
+
+  if (gateError.suppressStatus) {
+    // A genuine no-op, not a failure: the PR this run was about is closed or merged, so there is
+    // no verdict to publish and nothing went wrong. Exiting non-zero here would leave a red run in
+    // the Actions list for every late event delivery after a merge.
+    console.log(gateError.message);
+    return;
   }
 
   console.error(error.stack || error.message);
@@ -1796,8 +1813,8 @@ async function saveState(state, stateComment) {
 function createEvidenceWorkBudget() {
   return new EvidenceWorkBudget({
     maxItemsPerSnapshot: MAX_EVIDENCE_ITEMS_PER_SNAPSHOT,
-    maxResponseBytes: MAX_EVIDENCE_RESPONSE_BYTES,
-    maxResponseBytesPerWork: MAX_EVIDENCE_RESPONSE_BYTES_PER_RUN,
+    maxResponseBytes: config.maxEvidenceResponseBytes,
+    maxResponseBytesPerWork: config.maxEvidenceResponseBytesPerRun,
     maxRequestAttemptsPerWork: MAX_EVIDENCE_REQUEST_ATTEMPTS_PER_RUN,
     maxConcurrency: MAX_EVIDENCE_HTTP_CONCURRENCY,
   });
@@ -2245,14 +2262,27 @@ async function selectCurrentHeadProviderResult(artifacts, evidenceBudget) {
           headSha: resolvedSha,
         };
       }
-      if (
-        await commitIsAncestor(
-          resolvedSha,
-          statusSha.toLowerCase(),
-          ancestryCache,
-          evidenceBudget,
-        )
-      ) {
+      // Stale evidence — a genuine clean result bound to some commit that is not this head —
+      // must NOT pass the gate, and must not terminate the run either. `malformed` here used to
+      // do the latter: failIfSnapshotEvidenceIsInvalid throws before a marker is opened and
+      // before state is written, so every later run re-read the same stale state and threw again,
+      // with `error` never satisfiable by waiting (BTCMedia/btc-inc-os#1664). `pending` holds the
+      // same line and lets the run open a fresh cycle for the current head.
+      //
+      // Both the ancestor case (ordinary push) and the non-ancestor case (rebase / force-push,
+      // which orphans the reviewed commit) are stale in exactly the same sense. The ancestor case
+      // already recovered; the force-push case is the one that deadlocked, and it is the common
+      // one wherever signed commits force `commit --amend` before every push.
+      const isAncestorOfHead = await commitIsAncestor(
+        resolvedSha,
+        statusSha.toLowerCase(),
+        ancestryCache,
+        evidenceBudget,
+      );
+      if (isAncestorOfHead) {
+        // Unchanged: an older finding on this head's own history still outranks a newer clean
+        // result. Supersession is only meaningful along a single line of history, which is why
+        // this scan stays inside the ancestor branch rather than moving above it.
         const unsupersededFinding = await firstUnsupersededOlderFinding(
           resolvedSha,
           [...group.slice(groupIndex + 1), ...ordered.slice(index)],
@@ -2263,21 +2293,17 @@ async function selectCurrentHeadProviderResult(artifacts, evidenceBudget) {
         if (unsupersededFinding) {
           return unsupersededFinding;
         }
-        return {
-          ...artifact,
-          kind: "pending",
-          headSha: resolvedSha,
-          reason:
-            `latest Codex clean result is bound to prior head ${resolvedSha}; ` +
-            `waiting for a complete clean result on current head ${statusSha.toLowerCase()}`,
-        };
       }
+      const classification = classifyCleanEvidenceForHead({
+        resolvedSha,
+        statusSha,
+        isAncestorOfHead,
+      });
       return {
         ...artifact,
-        kind: "malformed",
-        reason:
-          `latest Codex clean result resolved to ${resolvedSha}, ` +
-          `not current head ${statusSha.toLowerCase()}`,
+        kind: classification.kind,
+        headSha: resolvedSha,
+        reason: classification.reason,
       };
     }
   }
@@ -2584,6 +2610,14 @@ function readConfig() {
     runId: requiredEnv("GITHUB_RUN_ID"),
     runAttempt: process.env.GITHUB_RUN_ATTEMPT || "1",
     maxWaitMs: secondsEnv("MAX_WAIT_SECONDS", 7200, { allowZero: false }) * 1000,
+    maxEvidenceResponseBytes: bytesEnv(
+      "EVIDENCE_MAX_RESPONSE_BYTES",
+      DEFAULT_MAX_EVIDENCE_RESPONSE_BYTES,
+    ),
+    maxEvidenceResponseBytesPerRun: bytesEnv(
+      "EVIDENCE_MAX_RESPONSE_BYTES_PER_RUN",
+      DEFAULT_MAX_EVIDENCE_RESPONSE_BYTES_PER_RUN,
+    ),
     requestTimeoutMs:
       secondsEnv("CODEX_REVIEW_GATE_REQUEST_TIMEOUT_SECONDS", 60, {
         allowZero: false,
@@ -2635,6 +2669,22 @@ function secondsEnv(name, fallback, { allowZero }) {
   return parsed;
 }
 
+// Byte budgets are SAFE INTEGERS, unlike the seconds inputs, which tolerate fractions:
+// EvidenceWorkBudget rejects a non-integer limit in its own constructor, and doing that validation
+// here means a typo fails at config-read with the offending variable named, rather than surfacing
+// later as an opaque budget-construction error mid-sweep.
+function bytesEnv(name, fallback) {
+  const raw = process.env[name];
+  if (!raw || !raw.trim()) {
+    return fallback;
+  }
+  const parsed = Number(raw.trim());
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error(`${name} must be a positive integer number of bytes`);
+  }
+  return parsed;
+}
+
 function parseRepo(repository) {
   const parts = repository.split("/");
   if (parts.length !== 2 || !parts[0] || !parts[1]) {
@@ -2662,16 +2712,19 @@ async function failIfPullRequestHeadChanged(phase = "while waiting for Codex") {
 }
 
 function failIfLoadedPullRequestHeadChanged(pullRequest, phase) {
-  if (
-    pullRequest.state !== "open" ||
-    pullRequest.merged === true ||
-    pullRequest.merged_at
-  ) {
-    throw new GateFailure(
+  if (pullRequestLifecycleEnded(pullRequest)) {
+    // Stop the run, but publish NOTHING. Two late deliveries after #1660 merged wrote
+    // `error: PR lifecycle changed …` onto the merge commit, leaving a permanently red required
+    // check that reads as "this merged with a failing required check" to anyone auditing history
+    // later. There is nothing left to protect at this point — the merge already happened — so a
+    // verdict here is pure misinformation. BTCMedia/btc-inc-os#1664.
+    const failure = new GateFailure(
       "error",
       `PR lifecycle changed ${phase}`,
       `PR #${activePrNumber} is no longer an open, unmerged pull request.`,
     );
+    failure.suppressStatus = true;
+    throw failure;
   }
   if (pullRequest.draft) {
     throw new GateFailure(
