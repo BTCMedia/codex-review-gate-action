@@ -366,6 +366,15 @@ function normalizeCodexCommentBody(body) {
     .replace(/\r\n?|[\u000B\u000C\u0085\u2028\u2029]/g, "\n");
 }
 
+// From 2026-10-16 Codex opens its pull-request review body with this tag on its own line
+// (btc-inc-os#2537). Accept it once, as the exact first line; anything else is left in place so
+// the closed grammar below still rejects it.
+// Takes the body as the caller already prepared it, so an untagged body is returned unchanged.
+function stripCodexReviewReceipt(body) {
+  const match = /^<!-- codex-review-receipt:v1 -->[ \t]*\r?\n/.exec(body);
+  return match ? body.slice(match[0].length).trim() : body;
+}
+
 function stripLeadingEmojiGraphemes(value) {
   let cursor = 0;
   let graphemeCount = 0;
@@ -523,7 +532,7 @@ export function parseCodexReviewArtifact(
     botLogins = DEFAULT_CODEX_BOT_LOGINS,
   } = {},
 ) {
-  const body = String(review?.body || "").trim();
+  const body = stripCodexReviewReceipt(String(review?.body || "").trim());
   const terminalLooking =
     new Set(["APPROVED", "COMMENTED", "CHANGES_REQUESTED"]).has(review?.state) ||
     body.startsWith("### 💡 Codex Review");
@@ -611,7 +620,7 @@ export function codexInlineParentReviewBodyHasClosedGrammar(review) {
     return false;
   }
 
-  const body = normalizeCodexCommentBody(review.body);
+  const body = stripCodexReviewReceipt(normalizeCodexCommentBody(review.body));
   if (!body || body.length > 5_000) {
     return false;
   }
