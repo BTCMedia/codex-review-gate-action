@@ -366,8 +366,8 @@ function normalizeCodexCommentBody(body) {
     .replace(/\r\n?|[\u000B\u000C\u0085\u2028\u2029]/g, "\n");
 }
 
-// From 2026-10-16 Codex opens its pull-request review body with this tag on its own line
-// (btc-inc-os#2537). Accept it once, as the exact first line; anything else is left in place so
+// From 2026-10-16 Codex opens its pull-request review body, and from 2026-10-19 its clean-result
+// issue comment, with this tag on its own line (btc-inc-os#2537). Accept it once, as the exact first line; anything else is left in place so
 // the closed grammar below still rejects it.
 // Takes the body as the caller already prepared it, so an untagged body is returned unchanged.
 function stripCodexReviewReceipt(body) {
@@ -433,7 +433,7 @@ export function parseCodexIssueCommentArtifact(
     botLogins = DEFAULT_CODEX_BOT_LOGINS,
   } = {},
 ) {
-  const body = normalizeCodexCommentBody(comment?.body);
+  const body = stripCodexReviewReceipt(normalizeCodexCommentBody(comment?.body));
   const terminalHeading = parseCodexIssueCommentTerminalHeading(body);
   if (!terminalHeading.terminalLooking || !isCodexBot(comment?.user?.login, botLogins)) {
     return null;
