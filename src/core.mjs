@@ -1035,7 +1035,7 @@ export function isCodexCompletionComment(comment, botLogins = DEFAULT_CODEX_BOT_
     return false;
   }
 
-  return /^Codex Review\s*:/i.test(String(comment.body || "").trim());
+  return /^Codex Review\s*:/i.test(stripCodexReviewReceipt(normalizeCodexCommentBody(comment.body)));
 }
 
 export function sameReactionIdentity(left, right) {

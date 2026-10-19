@@ -50,3 +50,11 @@ test("only the exact v1 tag as the first line is accepted", () => {
   const doubled = parse(`<!-- codex-review-receipt:v1 -->\n${RECEIPT_CLEAN_BODY}`);
   assert.notEqual(doubled?.kind, "clean");
 });
+
+test("a receipt-tagged clean comment still counts as the Codex completion comment", async () => {
+  const { isCodexCompletionComment, selectLatestCodexCompletionComment } = await import("../src/core.mjs");
+  assert.equal(isCodexCompletionComment(comment(LEGACY_CLEAN_BODY)), true);
+  assert.equal(isCodexCompletionComment(comment(RECEIPT_CLEAN_BODY)), true);
+  assert.equal(selectLatestCodexCompletionComment([comment(RECEIPT_CLEAN_BODY)])?.id, "6263495412");
+  assert.equal(isCodexCompletionComment(comment(`<!-- codex-review-receipt:v2 -->\n\n${LEGACY_CLEAN_BODY}`)), false);
+});
