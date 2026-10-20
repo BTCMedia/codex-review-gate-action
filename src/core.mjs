@@ -375,6 +375,15 @@ function stripCodexReviewReceipt(body) {
   return match ? body.slice(match[0].length).trim() : body;
 }
 
+// From 2026-10-20 a pull-request review whose findings sit in its OWN body (blob permalinks, no
+// inline children) can open with the inline-finding tag instead of the receipt (btc-inc-os#3106).
+// Accept it once, as the exact first line of a review body only; the body-findings grammar below
+// (exact full-SHA blob links bound to the review's commit) is unchanged.
+function stripCodexBodyFindingTag(body) {
+  const match = /^<!-- codex-code-review-finding:v1 -->[ \t]*\r?\n/.exec(body);
+  return match ? body.slice(match[0].length).trim() : body;
+}
+
 function stripLeadingEmojiGraphemes(value) {
   let cursor = 0;
   let graphemeCount = 0;
@@ -532,7 +541,10 @@ export function parseCodexReviewArtifact(
     botLogins = DEFAULT_CODEX_BOT_LOGINS,
   } = {},
 ) {
-  const body = stripCodexReviewReceipt(String(review?.body || "").trim());
+  const rawBody = String(review?.body || "").trim();
+  const receiptStripped = stripCodexReviewReceipt(rawBody);
+  // At most one leading tag: the receipt, or else the body-finding tag. Never both.
+  const body = receiptStripped !== rawBody ? receiptStripped : stripCodexBodyFindingTag(rawBody);
   const terminalLooking =
     new Set(["APPROVED", "COMMENTED", "CHANGES_REQUESTED"]).has(review?.state) ||
     body.startsWith("### 💡 Codex Review");
@@ -620,7 +632,9 @@ export function codexInlineParentReviewBodyHasClosedGrammar(review) {
     return false;
   }
 
-  const body = stripCodexReviewReceipt(normalizeCodexCommentBody(review.body));
+  const normalizedBody = normalizeCodexCommentBody(review.body);
+  const body = stripCodexReviewReceipt(normalizedBody);
+  const receiptWasStripped = body !== normalizedBody;
   if (!body || body.length > 5_000) {
     return false;
   }
@@ -639,16 +653,28 @@ export function codexInlineParentReviewBodyHasClosedGrammar(review) {
     lines[2] || "",
   )?.[1]?.toLowerCase();
   const parentCommit = review.commit_id.toLowerCase();
-  if (
-    !reviewedCommit ||
-    (reviewedCommit.length === 40
-      ? reviewedCommit !== parentCommit
-      : !parentCommit.startsWith(reviewedCommit))
+  let disclosureStart = 2;
+  if (reviewedCommit) {
+    if (
+      reviewedCommit.length === 40
+        ? reviewedCommit !== parentCommit
+        : !parentCommit.startsWith(reviewedCommit)
+    ) {
+      return false;
+    }
+    disclosureStart = 3;
+  } else if (
+    // From 2026-10-20 a receipt-tagged parent can omit the Reviewed commit line (btc-inc-os#3054).
+    // Allow that ONLY with the receipt present and no such line anywhere: the parent is then bound
+    // by its full commit_id alone, and collectCodexThreadEvidence still requires every child's
+    // original_commit_id to equal it. Mirrors upstream v2.2.7's allowKnownReceiptEnvelope path.
+    !receiptWasStripped ||
+    lines.some((line) => /^\*\*Reviewed commit:\*\*/i.test(line))
   ) {
     return false;
   }
 
-  return officialCodexDisclosureHasClosedGrammar(lines.slice(3).join("\n"));
+  return officialCodexDisclosureHasClosedGrammar(lines.slice(disclosureStart).join("\n"));
 }
 
 export function sortCodexArtifactsNewestFirst(artifacts) {
