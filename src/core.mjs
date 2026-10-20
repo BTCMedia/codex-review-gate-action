@@ -620,7 +620,9 @@ export function codexInlineParentReviewBodyHasClosedGrammar(review) {
     return false;
   }
 
-  const body = stripCodexReviewReceipt(normalizeCodexCommentBody(review.body));
+  const normalizedBody = normalizeCodexCommentBody(review.body);
+  const body = stripCodexReviewReceipt(normalizedBody);
+  const receiptWasStripped = body !== normalizedBody;
   if (!body || body.length > 5_000) {
     return false;
   }
@@ -639,16 +641,28 @@ export function codexInlineParentReviewBodyHasClosedGrammar(review) {
     lines[2] || "",
   )?.[1]?.toLowerCase();
   const parentCommit = review.commit_id.toLowerCase();
-  if (
-    !reviewedCommit ||
-    (reviewedCommit.length === 40
-      ? reviewedCommit !== parentCommit
-      : !parentCommit.startsWith(reviewedCommit))
+  let disclosureStart = 2;
+  if (reviewedCommit) {
+    if (
+      reviewedCommit.length === 40
+        ? reviewedCommit !== parentCommit
+        : !parentCommit.startsWith(reviewedCommit)
+    ) {
+      return false;
+    }
+    disclosureStart = 3;
+  } else if (
+    // From 2026-10-20 a receipt-tagged parent can omit the Reviewed commit line (btc-inc-os#3054).
+    // Allow that ONLY with the receipt present and no such line anywhere: the parent is then bound
+    // by its full commit_id alone, and collectCodexThreadEvidence still requires every child's
+    // original_commit_id to equal it. Mirrors upstream v2.2.7's allowKnownReceiptEnvelope path.
+    !receiptWasStripped ||
+    lines.some((line) => /^\*\*Reviewed commit:\*\*/i.test(line))
   ) {
     return false;
   }
 
-  return officialCodexDisclosureHasClosedGrammar(lines.slice(3).join("\n"));
+  return officialCodexDisclosureHasClosedGrammar(lines.slice(disclosureStart).join("\n"));
 }
 
 export function sortCodexArtifactsNewestFirst(artifacts) {
