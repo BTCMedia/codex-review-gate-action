@@ -375,6 +375,15 @@ function stripCodexReviewReceipt(body) {
   return match ? body.slice(match[0].length).trim() : body;
 }
 
+// From 2026-10-20 a pull-request review whose findings sit in its OWN body (blob permalinks, no
+// inline children) can open with the inline-finding tag instead of the receipt (btc-inc-os#3106).
+// Accept it once, as the exact first line of a review body only; the body-findings grammar below
+// (exact full-SHA blob links bound to the review's commit) is unchanged.
+function stripCodexBodyFindingTag(body) {
+  const match = /^<!-- codex-code-review-finding:v1 -->[ \t]*\r?\n/.exec(body);
+  return match ? body.slice(match[0].length).trim() : body;
+}
+
 function stripLeadingEmojiGraphemes(value) {
   let cursor = 0;
   let graphemeCount = 0;
@@ -532,7 +541,10 @@ export function parseCodexReviewArtifact(
     botLogins = DEFAULT_CODEX_BOT_LOGINS,
   } = {},
 ) {
-  const body = stripCodexReviewReceipt(String(review?.body || "").trim());
+  const rawBody = String(review?.body || "").trim();
+  const receiptStripped = stripCodexReviewReceipt(rawBody);
+  // At most one leading tag: the receipt, or else the body-finding tag. Never both.
+  const body = receiptStripped !== rawBody ? receiptStripped : stripCodexBodyFindingTag(rawBody);
   const terminalLooking =
     new Set(["APPROVED", "COMMENTED", "CHANGES_REQUESTED"]).has(review?.state) ||
     body.startsWith("### 💡 Codex Review");
